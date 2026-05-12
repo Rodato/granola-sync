@@ -23,24 +23,66 @@ from pathlib import Path
 
 # ---------- Config ----------
 GRANOLA_SUPPORT = Path.home() / "Library/Application Support/Granola"
-VAULT_ROOT = Path.home() / "Documents/Obsidian/Estudio Plural/Granola"
 TOKEN_CACHE = Path(__file__).resolve().parent / ".tokens.json"
-CLIENT_VERSION = "7.162.6"
 API = "https://api.granola.ai"
 
-_BASE_HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "*/*",
-    "X-Client-Version": CLIENT_VERSION,
-    "X-Granola-Platform": "darwin",
-}
 
+def _required_env(name: str, hint: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        sys.stderr.write(
+            f"error: {name} is not set.\n"
+            f"  {hint}\n"
+            f"  Either export it in your shell, or run ./install.sh to set it up\n"
+            f"  as a launchd agent with the value baked into the plist.\n"
+        )
+        sys.exit(2)
+    return value
+
+
+def vault_root() -> Path:
+    p = Path(
+        _required_env(
+            "GRANOLA_VAULT_ROOT",
+            "Path to the Obsidian folder where notes should be written, "
+            "e.g. ~/Documents/Obsidian/MyVault/Granola",
+        )
+    ).expanduser()
+    if not p.parent.exists():
+        sys.stderr.write(f"error: parent of GRANOLA_VAULT_ROOT does not exist: {p.parent}\n")
+        sys.exit(2)
+    return p
+
+
+def client_version() -> str:
+    # Try plist of installed Granola.app; fall back to env var; finally a sensible default
+    plist = Path("/Applications/Granola.app/Contents/Info.plist")
+    if plist.exists():
+        try:
+            import plistlib
+            with plist.open("rb") as f:
+                meta = plistlib.load(f)
+            v = meta.get("CFBundleShortVersionString")
+            if v:
+                return v
+        except Exception:
+            pass
+    return os.environ.get("GRANOLA_CLIENT_VERSION", "7.162.6")
 
 # ---------- HTTP ----------
+def _headers(token: str) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "X-Client-Version": client_version(),
+        "X-Granola-Platform": "darwin",
+        "Authorization": f"Bearer {token}",
+    }
+
+
 def api_call(token: str, path: str, body: dict | None = None) -> object:
-    headers = {**_BASE_HEADERS, "Authorization": f"Bearer {token}"}
     data = json.dumps(body or {}).encode()
-    req = urllib.request.Request(f"{API}{path}", data=data, headers=headers, method="POST")
+    req = urllib.request.Request(f"{API}{path}", data=data, headers=_headers(token), method="POST")
     resp = urllib.request.urlopen(req, timeout=30)
     raw = resp.read()
     if resp.headers.get("content-encoding") == "gzip":
@@ -51,8 +93,23 @@ def api_call(token: str, path: str, body: dict | None = None) -> object:
 def load_tokens() -> dict:
     if TOKEN_CACHE.exists():
         return json.loads(TOKEN_CACHE.read_text())
-    sup = json.loads((GRANOLA_SUPPORT / "supabase.json").read_text())
-    return json.loads(sup["workos_tokens"])
+    sup_path = GRANOLA_SUPPORT / "supabase.json"
+    if not sup_path.exists():
+        sys.stderr.write(
+            f"error: cannot find {sup_path}\n"
+            "  Open the Granola desktop app and sign in at least once,\n"
+            "  then re-run this script.\n"
+        )
+        sys.exit(2)
+    try:
+        sup = json.loads(sup_path.read_text())
+        return json.loads(sup["workos_tokens"])
+    except (json.JSONDecodeError, KeyError) as e:
+        sys.stderr.write(
+            f"error: failed to parse Granola tokens from {sup_path}: {e}\n"
+            "  Granola's storage format may have changed. File an issue.\n"
+        )
+        sys.exit(2)
 
 
 def save_tokens(t: dict) -> None:
@@ -61,11 +118,22 @@ def save_tokens(t: dict) -> None:
 
 
 def refresh_token(tokens: dict) -> str:
-    new = api_call(
-        tokens["access_token"],
-        "/v1/refresh-access-token",
-        {"refresh_token": tokens["refresh_token"]},
-    )
+    try:
+        new = api_call(
+            tokens["access_token"],
+            "/v1/refresh-access-token",
+            {"refresh_token": tokens["refresh_token"]},
+        )
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            sys.stderr.write(
+                f"error: token refresh failed ({e.code}). The cached refresh\n"
+                "  token is no longer valid. Open the Granola desktop app once\n"
+                f"  (so it writes a fresh supabase.json), delete {TOKEN_CACHE},\n"
+                "  and re-run this script.\n"
+            )
+            sys.exit(2)
+        raise
     save_tokens(new)
     return new["access_token"]
 
@@ -235,16 +303,18 @@ def build_markdown(doc: dict, panels: list[dict]) -> str:
 
 
 def sync(dry_run: bool = False) -> None:
-    print("→ Refrescando token...")
+    root = vault_root()
+    print(f"→ Vault: {root}")
+    print("→ Refreshing token...")
     token = refresh_token(load_tokens())
 
-    print("→ Descargando lista de documentos...")
+    print("→ Fetching document list...")
     docs = fetch_all_docs(token)
-    print(f"  {len(docs)} documentos")
+    print(f"  {len(docs)} documents")
 
-    print("→ Mapeando carpetas...")
+    print("→ Mapping folders...")
     folder_of = fetch_folder_map(token)
-    print(f"  {len(folder_of)} docs asignados a carpetas")
+    print(f"  {len(folder_of)} docs assigned to folders")
 
     written = skipped = errors = 0
     for i, doc in enumerate(docs, 1):
@@ -256,7 +326,7 @@ def sync(dry_run: bool = False) -> None:
         date_prefix = (doc.get("created_at") or "0000-00-00")[:10]
 
         folder_title = folder_of.get(doc_id, "")
-        out_dir = VAULT_ROOT / sanitize(folder_title) if folder_title else VAULT_ROOT
+        out_dir = root / sanitize(folder_title) if folder_title else root
         filename = f"{date_prefix}_{sanitize(title)}.md"
         out_path = out_dir / filename
 
@@ -278,12 +348,23 @@ def sync(dry_run: bool = False) -> None:
         print(f"  [{i:>3}/{len(docs)}] {action}{'(dry)' if dry_run else ''} {rel}")
 
         if not dry_run:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(md, encoding="utf-8")
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(md, encoding="utf-8")
+            except PermissionError:
+                sys.stderr.write(
+                    f"\nerror: PermissionError writing to {out_path}\n"
+                    "  macOS blocks launchd-spawned processes from ~/Documents,\n"
+                    "  ~/Desktop, and ~/Downloads unless the python3 binary has\n"
+                    "  Full Disk Access. Grant it under:\n"
+                    "    System Settings → Privacy & Security → Full Disk Access\n"
+                    f"  Add: {sys.executable}\n"
+                )
+                sys.exit(2)
         written += 1
 
     print()
-    print(f"Listo. {written} escritos, {skipped} sin cambios, {errors} errores.")
+    print(f"Done. {written} written, {skipped} unchanged, {errors} errors.")
 
 
 if __name__ == "__main__":
